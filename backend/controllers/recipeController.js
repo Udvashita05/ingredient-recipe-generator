@@ -1,39 +1,21 @@
 const Recipe = require('../models/Recipe');
-const axios = require('axios');
+const ytSearch = require('yt-search');
 
 // Fetch YouTube video dynamically
 const getYoutubeVideo = async (query) => {
-  if (!process.env.YOUTUBE_API_KEY || process.env.YOUTUBE_API_KEY === 'mock') {
-    // If no real API key is set, we return an embedded URL format so the UI still looks like it's a real connect API
-    // Let's at least format a generic food video ID for testing. 
-    return {
-      title: `${query} | Best Authentic Recipe`,
-      thumbnail: 'https://images.unsplash.com/photo-1493770348161-369560ae357d?q=80&w=600&auto=format&fit=crop',
-      url: 'https://www.youtube.com/watch?v=R3XyM5D1wYI'
-    };
-  }
-  
   try {
-    const response = await axios.get(`https://www.googleapis.com/youtube/v3/search`, {
-      params: {
-        part: 'snippet',
-        q: query,
-        key: process.env.YOUTUBE_API_KEY,
-        type: 'video',
-        maxResults: 1
-      }
-    });
-
-    if (response.data.items && response.data.items.length > 0) {
-      const video = response.data.items[0];
+    const r = await ytSearch(query);
+    const videos = r.videos;
+    if (videos && videos.length > 0) {
+      const video = videos[0];
       return {
-        title: video.snippet.title,
-        thumbnail: video.snippet.thumbnails.high.url,
-        url: `https://www.youtube.com/watch?v=${video.id.videoId}`
+        title: video.title,
+        thumbnail: video.image || video.thumbnail,
+        url: video.url
       };
     }
   } catch (error) {
-    console.error('YouTube API Error:', error.message);
+    console.error('yt-search Error:', error.message);
   }
   return null;
 };
@@ -49,70 +31,69 @@ const mapLocationToRegion = (location) => {
   return 'Global'; // Default
 };
 
+const { GoogleGenAI } = require('@google/genai');
+
 const generateRecipes = async (req, res) => {
   const { ingredients, craving, location } = req.body;
 
   try {
-    const allRecipes = await Recipe.find({});
-    const userRegion = mapLocationToRegion(location || '');
-    const userIngredients = (ingredients || []).map(i => i.toLowerCase().trim());
+    if (!process.env.GEMINI_API_KEY) {
+      throw new Error('GEMINI_API_KEY is not configured');
+    }
+
+    const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
     
-    let scoredRecipes = allRecipes.map(recipe => {
-      let score = 0;
-      const recipeIngredients = recipe.ingredients.map(i => i.toLowerCase().trim());
-      
-      let matchedCount = 0;
-      userIngredients.forEach(ui => {
-        // Find if user ingredient matches any recipe ingredient
-        if (recipeIngredients.some(ri => ri.includes(ui) || ui.includes(ri))) {
-          matchedCount++;
-        }
-      });
-      
-      // Overhaul scoring to heavily prioritize ingredients
-      score += matchedCount * 50; // +50 points per matched ingredient!
-      
-      if (craving && recipe.tags.map(t => t.toLowerCase()).includes(craving.toLowerCase())) {
-        score += 20; // 20 points for craving match
-      }
+    const prompt = `You are an expert culinary AI for an app called MasalaMatch. Suggest exactly 6 exquisite recipe ideas based on the following:
+- Ingredients available: ${(ingredients || []).join(', ')}
+- Craving: ${craving || 'Anything'}
+- Location context: ${location || 'Global'}
 
-      if (userRegion && recipe.region.toLowerCase() === userRegion.toLowerCase()) {
-        score += 20; // 20 points for location match
-      }
+Respond ONLY with a valid JSON array of objects. Each object must have these exact keys:
+"name" (string, the recipe name),
+"region" (string, the regional cuisine style),
+"ingredients" (array of strings, key ingredients used in the recipe),
+"tags" (array of strings, e.g., ["comfort", "dinner", "spicy"]),
+"score" (number, a match percentage score from 60 to 100 based on how well it fits)
 
-      // If no ingredients match at all, heavily penalize so it sinks to the bottom
-      if (matchedCount === 0) {
-        score = -10;
-      }
+Do not include any markdown formatting like \`\`\`json or \`\`\`. Just the raw JSON array.`;
 
-      // Final score calculation for UI (percentage)
-      // We calculate a percentage purely for UI dazzle based on the highest possible score
-      let finalScore = score > 0 ? Math.min(Math.round((score / (userIngredients.length * 50 + 40)) * 100), 100) : 5;
-
-      return {
-        ...recipe.toObject(),
-        score: finalScore, // For UI match %
-        rawScore: score, // For sorting accurately
-        matchedCount
-      };
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: prompt,
     });
 
-    // Sort by rawScore to strongly prioritize ingredients
-    scoredRecipes.sort((a, b) => b.rawScore - a.rawScore);
-    
-    // Take top 6
-    const topRecipes = scoredRecipes.slice(0, 6);
+    let generatedText = response.text.trim();
+    if (generatedText.startsWith('```json')) {
+      generatedText = generatedText.slice(7, -3).trim();
+    } else if (generatedText.startsWith('```')) {
+      generatedText = generatedText.slice(3, -3).trim();
+    }
 
-    // Fetch youtube videos dynamically connecting API
+    let topRecipes = [];
+    try {
+      topRecipes = JSON.parse(generatedText);
+    } catch (parseError) {
+      console.error('Failed to parse Gemini response:', generatedText);
+      throw new Error('Failed to generate valid recipes from AI');
+    }
+
+    // Assign actual youtube video and use its thumbnail as the exact recipe image
     const recipesWithVideos = await Promise.all(topRecipes.map(async (recipe) => {
       const query = `authentic ${recipe.name} recipe step by step`;
       const video = await getYoutubeVideo(query);
-      return { ...recipe, video };
+      
+      const defaultFallback = 'https://images.unsplash.com/photo-1493770348161-369560ae357d?q=80&w=600&auto=format&fit=crop';
+      return { 
+        ...recipe, 
+        imageUrl: video ? video.thumbnail : defaultFallback, 
+        video 
+      };
     }));
 
     res.json(recipesWithVideos);
 
   } catch (error) {
+    console.error('Recipe Generation Error:', error.message);
     res.status(500).json({ message: error.message });
   }
 };
